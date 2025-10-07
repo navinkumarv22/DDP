@@ -1,0 +1,613 @@
+// # Custom NCCL DDP (PyTorch‑model wrapper)
+
+// This is a minimal, production‑style skeleton for a **framework‑agnostic DDP package**: we use **CUDA+NCCL** in a C++/CUDA backend, expose it via **pybind11**, and keep the high‑level model & autograd in **PyTorch**. You can wrap any `nn.Module` (e.g., your MLP/Transformer) without using `torch.distributed`.
+
+// ---
+
+// ## Folder layout
+
+// ```
+// ddp_custom/
+// ├── CMakeLists.txt
+// ├── pyproject.toml
+// ├── README.md
+// ├── src/
+// │   └── ddp_backend/
+// │       ├── bindings.cpp
+// │       ├── process_group_nccl.h
+// │       ├── process_group_nccl.cpp
+// │       ├── kernels.cu
+// │       └── macros.h
+// └── python/
+//     └── ddp/
+//         ├── __init__.py
+//         ├── ddp.py
+//         ├── process_group.py
+//         └── utils.py
+// ```
+
+// > Build with `pip install -v .` from the repo root (uses scikit‑build‑core + CMake).
+
+// ---
+
+// ## Build system
+
+// ### `pyproject.toml`
+
+// ````toml
+// [build-system]
+// requires = [
+//   "scikit-build-core>=0.9",
+//   "pybind11>=2.11",
+// ]
+// build-backend = "scikit_build_core.build"
+
+// [project]
+// name = "ddp_backend"
+// version = "0.1.0"
+// description = "NCCL-based ProcessGroup and DDP wrapper for PyTorch models"
+// authors = [{ name = "GV" }]
+// requires-python = ">=3.8"
+
+// [tool.scikit-build]
+// # scikit-build-core >= 0.8 expects these keys under this table
+// cmake.version = ">=3.20"
+// cmake.args = ["-DCMAKE_CUDA_ARCHITECTURES=native"]
+// wheel.expand-macos-universal-tags = true
+// ```toml
+// [build-system]
+// requires = ["scikit-build-core>=0.9", "pybind11>=2.11", "packaging"]
+// build-backend = "scikit_build_core.build"
+
+// [project]
+// name = "ddp_backend"
+// version = "0.1.0"
+// description = "NCCL-based ProcessGroup and DDP wrapper for PyTorch models"
+// authors = [{ name = "GV" }]
+// requires-python = ">=3.8"
+
+// [tool.scikit-build]
+// wheel.expand-macos-universal-tags = true
+
+// [tool.scikit-build.cmake]
+// minimum-version = "3.20"
+
+// [tool.scikit-build.build]
+// cmake.args = [
+//   "-DCMAKE_CUDA_ARCHITECTURES=native",
+// ]
+// ````
+
+// ### `CMakeLists.txt`
+
+// ````cmake
+// cmake_minimum_required(VERSION 3.20)
+// project(ddp_backend LANGUAGES CXX CUDA)
+// set(CMAKE_CXX_STANDARD 17)
+// set(CMAKE_CUDA_STANDARD 17)
+
+// # Required for pybind11 imported by pip
+// find_package(pybind11 CONFIG REQUIRED)
+// find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
+
+// # CUDA & NCCL
+// find_package(CUDAToolkit REQUIRED)
+
+// # NCCL (manual find)
+// find_path(NCCL_INCLUDE_DIR nccl.h HINTS
+//   /usr/include /usr/local/include /usr/include/nccl ${CUDAToolkit_INCLUDE_DIRS})
+// find_library(NCCL_LIBRARY nccl HINTS
+//   /usr/lib /usr/lib/x86_64-linux-gnu /usr/local/lib /usr/lib64)
+// if(NOT NCCL_INCLUDE_DIR OR NOT NCCL_LIBRARY)
+//   message(FATAL_ERROR "NCCL not found. Set NCCL_INCLUDE_DIR & NCCL_LIBRARY")
+// endif()
+
+// pybind11_add_module(ddp_backend
+//   src/ddp_backend/bindings.cpp
+//   src/ddp_backend/process_group_nccl.cpp
+//   src/ddp_backend/kernels.cu)
+
+// target_include_directories(ddp_backend PRIVATE
+//   ${NCCL_INCLUDE_DIR}
+//   ${CUDAToolkit_INCLUDE_DIRS}
+//   src)
+
+// target_link_libraries(ddp_backend PRIVATE
+//   ${NCCL_LIBRARY}
+//   CUDA::cudart)
+
+// # visibility / warnings
+// if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+//   target_compile_options(ddp_backend PRIVATE -fvisibility=hidden -Wno-deprecated-declarations)
+// endif()
+// ```cmake
+// cmake_minimum_required(VERSION 3.20)
+// project(ddp_backend LANGUAGES CXX CUDA)
+// set(CMAKE_CXX_STANDARD 17)
+// set(CMAKE_CUDA_STANDARD 17)
+
+// find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
+// find_package(pybind11 REQUIRED)
+
+// # CUDA & NCCL
+// find_package(CUDAToolkit REQUIRED)
+// # If your CMake doesn't have FindNCCL, use manual path or pkg-config
+// find_path(NCCL_INCLUDE_DIR nccl.h HINTS /usr/include /usr/local/include /usr/include/nccl /usr/local/cuda/include)
+// find_library(NCCL_LIBRARY nccl HINTS /usr/lib /usr/lib/x86_64-linux-gnu /usr/local/lib /usr/lib64)
+// if(NOT NCCL_INCLUDE_DIR OR NOT NCCL_LIBRARY)
+//   message(FATAL_ERROR "NCCL not found. Set NCCL_INCLUDE_DIR & NCCL_LIBRARY")
+// endif()
+
+// add_library(ddp_backend MODULE
+//   src/ddp_backend/bindings.cpp
+//   src/ddp_backend/process_group_nccl.cpp
+//   src/ddp_backend/kernels.cu)
+
+// target_include_directories(ddp_backend PRIVATE
+//   ${NCCL_INCLUDE_DIR}
+//   ${CUDAToolkit_INCLUDE_DIRS}
+//   src)
+
+// target_link_libraries(ddp_backend PRIVATE
+//   pybind11::module
+//   ${NCCL_LIBRARY}
+//   CUDA::cudart)
+
+// # Proper Python module name
+// set_target_properties(ddp_backend PROPERTIES
+//   PREFIX ""
+//   OUTPUT_NAME "ddp_backend"
+// )
+
+// # On some systems need -Wno-deprecated-declarations for CUDA headers
+// if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+//   target_compile_options(ddp_backend PRIVATE -fvisibility=hidden -Wno-deprecated-declarations)
+// endif()
+// ````
+
+// ---
+
+// ## C++/CUDA backend
+
+// ### `src/ddp_backend/macros.h`
+
+// ```cpp
+// #pragma once
+// #include <cstdio>
+// #include <cstdlib>
+// #include <cuda_runtime.h>
+// #include <nccl.h>
+
+// #define CUDA_CHECK(cmd) do { \
+//   cudaError_t e_ = (cmd); \
+//   if (e_ != cudaSuccess) { \
+//     fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(e_)); \
+//     std::exit(EXIT_FAILURE); \
+//   } \
+// } while(0)
+
+// #define NCCL_CHECK(cmd) do { \
+//   ncclResult_t r_ = (cmd); \
+//   if (r_ != ncclSuccess) { \
+//     fprintf(stderr, "NCCL error %s:%d: %s\n", __FILE__, __LINE__, ncclGetErrorString(r_)); \
+//     std::exit(EXIT_FAILURE); \
+//   } \
+// } while(0)
+// ```
+
+// ### `src/ddp_backend/process_group_nccl.h`
+
+// ```cpp
+// #pragma once
+// #include <cstddef>
+// #include <nccl.h>
+// #include <cuda_runtime.h>
+// #include <vector>
+// #include <string>
+
+// struct PGOptions {
+//   int device = 0;  // cuda device index for this rank
+//   int rank = 0;
+//   int world = 1;
+//   int stream_priority = -1; // -1 -> high priority
+// };
+
+// class ProcessGroupNCCL {
+// public:
+//   ProcessGroupNCCL(const ncclUniqueId& uid, const PGOptions& opt);
+//   ~ProcessGroupNCCL();
+
+//   int rank() const { return rank_; }
+//   int world_size() const { return world_; }
+//   cudaStream_t stream() const { return stream_; }
+
+//   // collectives (inplace)
+//   void allreduce_float32(float* dev_ptr, size_t count);
+//   void broadcast_float32(float* dev_ptr, size_t count, int root);
+//   void barrier();
+
+// private:
+//   int device_ = 0;
+//   int rank_ = 0;
+//   int world_ = 1;
+//   ncclComm_t comm_ = nullptr;
+//   cudaStream_t stream_ = nullptr;
+// };
+// ```
+
+// ### `src/ddp_backend/process_group_nccl.cpp`
+
+// ```cpp
+// #include "process_group_nccl.h"
+// #include "macros.h"
+
+// ProcessGroupNCCL::ProcessGroupNCCL(const ncclUniqueId& uid, const PGOptions& opt)
+// : device_(opt.device), rank_(opt.rank), world_(opt.world) {
+//   CUDA_CHECK(cudaSetDevice(device_));
+//   int least, greatest;
+//   CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
+//   int prio = (opt.stream_priority < 0) ? greatest : least;
+//   CUDA_CHECK(cudaStreamCreateWithPriority(&stream_, cudaStreamNonBlocking, prio));
+//   NCCL_CHECK(ncclCommInitRank(&comm_, world_, uid, rank_));
+// }
+
+// ProcessGroupNCCL::~ProcessGroupNCCL() {
+//   if (comm_) ncclCommDestroy(comm_);
+//   if (stream_) cudaStreamDestroy(stream_);
+// }
+
+// void ProcessGroupNCCL::allreduce_float32(float* dev_ptr, size_t count) {
+//   NCCL_CHECK(ncclAllReduce((const void*)dev_ptr, (void*)dev_ptr,
+//                            count, ncclFloat, ncclSum, comm_, stream_));
+// }
+
+// void ProcessGroupNCCL::broadcast_float32(float* dev_ptr, size_t count, int root) {
+//   NCCL_CHECK(ncclBroadcast((const void*)dev_ptr, (void*)dev_ptr,
+//                            count, ncclFloat, root, comm_, stream_));
+// }
+
+// void ProcessGroupNCCL::barrier() {
+//   // launch empty kernel or event to ensure stream order, then sync
+//   CUDA_CHECK(cudaStreamSynchronize(stream_));
+// }
+// ```
+
+// ### `src/ddp_backend/kernels.cu`
+
+// ```cuda
+// #include <cuda_runtime.h>
+// extern "C" __global__ void scale_f32(float* p, float alpha, size_t n) {
+//   size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+//   if (i < n) p[i] *= alpha;
+// }
+
+// extern "C" void launch_scale_f32(float* p, float alpha, size_t n, cudaStream_t s) {
+//   int bs = 256; int gs = (int)((n + bs - 1) / bs);
+//   scale_f32<<<gs, bs, 0, s>>>(p, alpha, n);
+// }
+// ```
+
+// ### `src/ddp_backend/bindings.cpp`
+
+// ```cpp
+// #include <pybind11/pybind11.h>
+// #include <pybind11/stl.h>
+// #include <cuda_runtime.h>
+// #include <nccl.h>
+// #include "process_group_nccl.h"
+// #include "macros.h"
+
+// namespace py = pybind11;
+
+// PYBIND11_MODULE(ddp_backend, m) {
+//   py::class_<ncclUniqueId>(m, "NcclId");
+
+//   m.def("nccl_get_unique_id", [](){
+//     ncclUniqueId id; NCCL_CHECK(ncclGetUniqueId(&id));
+//     // return as bytes to Python (easy to bcast via Python)
+//     return py::bytes(reinterpret_cast<char*>(&id), sizeof(ncclUniqueId));
+//   });
+
+//   m.def("nccl_id_from_bytes", [](py::bytes b){
+//     ncclUniqueId id{}; std::string s = b;
+//     if (s.size() != sizeof(ncclUniqueId)) throw std::runtime_error("bad id size");
+//     memcpy(&id, s.data(), s.size());
+//     return id; // pybind11 has holder
+//   });
+
+//   py::class_<PGOptions>(m, "PGOptions")
+//     .def(py::init<>())
+//     .def_readwrite("device", &PGOptions::device)
+//     .def_readwrite("rank", &PGOptions::rank)
+//     .def_readwrite("world", &PGOptions::world)
+//     .def_readwrite("stream_priority", &PGOptions::stream_priority);
+
+//   py::class_<ProcessGroupNCCL>(m, "ProcessGroupNCCL")
+//     .def(py::init<const ncclUniqueId&, const PGOptions&>())
+//     .def_property_readonly("rank", &ProcessGroupNCCL::rank)
+//     .def_property_readonly("world_size", &ProcessGroupNCCL::world_size)
+//     .def("allreduce_float32", &ProcessGroupNCCL::allreduce_float32)
+//     .def("broadcast_float32", &ProcessGroupNCCL::broadcast_float32)
+//     .def("barrier", &ProcessGroupNCCL::barrier);
+
+//   m.def("cuda_device_synchronize", [](){ cudaDeviceSynchronize(); });
+//   m.def("launch_scale_f32", [](size_t addr, float alpha, size_t n){
+//     auto* p = reinterpret_cast<float*>(addr);
+//     // Using default stream; for pg stream wiring, call from Python with pg.stream if exposed.
+//     extern void launch_scale_f32(float*, float, size_t, cudaStream_t);
+//     launch_scale_f32(p, alpha, n, 0);
+//   });
+// }
+// ```
+
+// ---
+
+// ## Python package
+
+// ### `python/ddp/__init__.py`
+
+// ```python
+// from .process_group import init_process_group, ProcessGroup
+// from .ddp import DistributedDataParallel, ParamSpec
+// ```
+
+// ### `python/ddp/process_group.py`
+
+// ```python
+// import os
+// import socket
+// import pickle
+// import torch
+// import ddp_backend
+
+// class ProcessGroup:
+//     def __init__(self, rank: int, world: int, device: int, unique_id_bytes: bytes):
+//         self.rank = rank
+//         self.world = world
+//         self.device = device
+//         torch.cuda.set_device(device)
+//         opts = ddp_backend.PGOptions()
+//         opts.device = device
+//         opts.rank = rank
+//         opts.world = world
+//         self._pg = ddp_backend.ProcessGroupNCCL(ddp_backend.nccl_id_from_bytes(unique_id_bytes), opts)
+
+//     @property
+//     def world_size(self):
+//         return self._pg.world_size
+
+//     def allreduce_(self, tensor: torch.Tensor):
+//         assert tensor.is_cuda and tensor.dtype == torch.float32 and tensor.is_contiguous()
+//         ddp_backend.cuda_device_synchronize()  # ensure prior work done, can be relaxed
+//         self._pg.allreduce_float32(tensor.data_ptr(), tensor.numel())
+
+//     def broadcast_(self, tensor: torch.Tensor, root=0):
+//         assert tensor.is_cuda and tensor.dtype == torch.float32 and tensor.is_contiguous()
+//         self._pg.broadcast_float32(tensor.data_ptr(), tensor.numel(), int(root))
+
+//     def barrier(self):
+//         self._pg.barrier()
+
+
+// def init_process_group():
+//     """
+//     bootstraps like torchrun: expects RANK, WORLD_SIZE, LOCAL_RANK set.
+//     rank0 creates NCCL unique id and shares via a simple TCP broadcast to others.
+//     For multi-node, set MASTER_ADDR/MASTER_PORT envs and ensure connectivity.
+//     """
+//     rank = int(os.environ["RANK"]) if "RANK" in os.environ else 0
+//     world = int(os.environ.get("WORLD_SIZE", "1"))
+//     local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
+//     master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
+//     master_port = int(os.environ.get("MASTER_PORT", "29500"))
+
+//     if rank == 0:
+//         uid_bytes = ddp_backend.nccl_get_unique_id()
+//         # serve uid over TCP to the others
+//         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+//             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+//             s.bind((master_addr, master_port))
+//             s.listen(world - 1)
+//             for _ in range(world - 1):
+//                 conn, _ = s.accept()
+//                 with conn:
+//                     conn.sendall(uid_bytes)
+//     else:
+//         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as c:
+//             c.connect((master_addr, master_port))
+//             uid_bytes = b""
+//             need = 128  # sizeof(ncclUniqueId)
+//             while len(uid_bytes) < need:
+//                 chunk = c.recv(need - len(uid_bytes))
+//                 if not chunk: break
+//                 uid_bytes += chunk
+
+//     pg = ProcessGroup(rank=rank, world=world, device=local_rank, unique_id_bytes=uid_bytes)
+//     return pg, rank, world, local_rank
+// ```
+
+// ### `python/ddp/ddp.py`
+
+// ```python
+// from dataclasses import dataclass
+// from typing import List, Tuple
+// import torch
+
+// @dataclass
+// class ParamSpec:
+//     length_elems: int
+//     device: int
+//     p_ref: torch.nn.Parameter
+//     offset: int = 0  # filled by bucketization
+
+// class _Bucket:
+//     def __init__(self, capacity_elems: int, device: int):
+//         self.buffer = torch.empty(capacity_elems, device=device, dtype=torch.float32)
+//         self.params: List[ParamSpec] = []
+//         self.size = 0
+//         self.ready = 0  # number of params that have seen a grad this step
+
+//     def add(self, ps: ParamSpec):
+//         ps.offset = self.size
+//         self.params.append(ps)
+//         self.size += ps.length_elems
+
+// class DistributedDataParallel:
+//     def __init__(self, param_specs: List[ParamSpec], process_group, bucket_bytes: int = 25*1024*1024):
+//         self.pg = process_group
+//         self.param_specs = param_specs
+//         self.world_size = process_group.world_size
+//         self.bucket_elems = bucket_bytes // 4
+
+//         # pack into buckets (reverse order to start comm earlier)
+//         cur = _Bucket(self.bucket_elems, device=param_specs[0].device)
+//         self.buckets: List[_Bucket] = []
+//         for ps in reversed(param_specs):
+//             assert ps.device == param_specs[0].device, "single-device per rank in this minimal DDP"
+//             if cur.size + ps.length_elems > self.bucket_elems:
+//                 self.buckets.append(cur)
+//                 cur = _Bucket(self.bucket_elems, device=ps.device)
+//             cur.add(ps)
+//         if cur.params:
+//             self.buckets.append(cur)
+//         self.buckets.reverse()
+
+//         # register autograd hooks to copy grads into bucket slices
+//         for ps in self.param_specs:
+//             p = ps.p_ref
+//             def make_hook(ps_local: ParamSpec):
+//                 def _hook(grad: torch.Tensor):
+//                     if grad is None:
+//                         return None
+//                     # ensure float32 view (we allreduce in fp32 for stability)
+//                     g = grad.view(-1).detach().to(torch.float32)
+//                     b = self._bucket_of(ps_local)
+//                     b.buffer[ps_local.offset: ps_local.offset + ps_local.length_elems].copy_(g, non_blocking=True)
+//                     b.ready += 1
+//                     return grad
+//                 return _hook
+//             p.register_hook(make_hook(ps))
+
+//     def _bucket_of(self, ps: ParamSpec) -> _Bucket:
+//         # linear search is fine for small param counts; could map param->bucket idx
+//         for b in self.buckets:
+//             if ps in b.params:
+//                 return b
+//         raise RuntimeError("param not in any bucket")
+
+//     def broadcast_parameters(self, root: int = 0):
+//         # broadcast each parameter tensor in place (fp32 view)
+//         for ps in self.param_specs:
+//             p = ps.p_ref.data.to(torch.float32).contiguous()
+//             self.pg.broadcast_(p, root=root)
+//             # copy back (cast if original was not fp32)
+//             ps.p_ref.data.copy_(p.view_as(ps.p_ref.data))
+
+//     def synchronize(self):
+//         # allreduce any buckets that became ready (i.e., all grads seen)
+//         for b in self.buckets:
+//             if b.ready == len(b.params):
+//                 # inplace sum
+//                 self.pg.allreduce_(b.buffer[:b.size])
+//                 # average
+//                 b.buffer[:b.size].div_(self.world_size)
+//                 # scatter back into .grad
+//                 for ps in b.params:
+//                     start = ps.offset; end = start + ps.length_elems
+//                     view = b.buffer[start:end]
+//                     p = ps.p_ref
+//                     if p.grad is None:
+//                         p.grad = torch.empty_like(p.data)
+//                     p.grad.view(-1).copy_(view.to(p.grad.dtype))
+//                 b.ready = 0  # reset for next iteration
+// ```
+
+// ### `python/ddp/utils.py`
+
+// ```python
+// def flat_param_specs(module, device):
+//     specs = []
+//     for p in module.parameters():
+//         specs.append(dict(length_elems=p.numel(), device=device, p_ref=p))
+//     return specs
+// ```
+
+// ---
+
+// ## Example: wrap a PyTorch MLP and train
+
+// ```python
+// # example_train.py
+// import os, time
+// import torch
+// import torch.nn as nn
+// from ddp import init_process_group, DistributedDataParallel, ParamSpec
+
+// class MLP(nn.Module):
+//     def __init__(self, n_in=128, hidden=256, n_out=10):
+//         super().__init__()
+//         self.net = nn.Sequential(
+//             nn.Linear(n_in, hidden), nn.ReLU(),
+//             nn.Linear(hidden, hidden), nn.ReLU(),
+//             nn.Linear(hidden, n_out)
+//         )
+//     def forward(self, x): return self.net(x)
+
+// if __name__ == "__main__":
+//     pg, rank, world, local_rank = init_process_group()
+//     device = torch.device(f"cuda:{local_rank}")
+
+//     # model & optimizer
+//     model = MLP().to(device)
+//     specs = [ParamSpec(length_elems=p.numel(), device=device.index, p_ref=p) for p in model.parameters()]
+//     ddp = DistributedDataParallel(specs, pg, bucket_bytes=25*1024*1024)
+//     ddp.broadcast_parameters(root=0)
+
+//     opt = torch.optim.AdamW(model.parameters(), lr=3e-3)
+//     loss_fn = nn.CrossEntropyLoss()
+
+//     # toy data
+//     x = torch.randn(1024, 128, device=device)
+//     y = torch.randint(0, 10, (1024,), device=device)
+
+//     for step in range(100):
+//         opt.zero_grad(set_to_none=True)
+//         logits = model(x)
+//         loss = loss_fn(logits, y)
+//         loss.backward()
+//         # synchronize (allreduce buckets and populate p.grad averaged)
+//         ddp.synchronize()
+//         opt.step()
+//         if rank == 0 and step % 10 == 0:
+//             print(f"step {step} loss {loss.item():.4f}")
+// ```
+
+// ---
+
+// ## Build & run
+
+// ```bash
+// # From repo root
+// export CUDA_HOME=/usr/local/cuda
+// python -m pip install -U pip
+// pip install -v .
+
+// # If NCCL isn't auto-found, point CMake at it:
+// #   pip install -v . \
+// #     -Ccmake.args=-DNCCL_INCLUDE_DIR=/usr/include \
+// #     -Ccmake.args=-DNCCL_LIBRARY=/usr/lib/x86_64-linux-gnu/libnccl.so
+
+// # Single node 2 GPUs
+// export CUDA_VISIBLE_DEVICES=0,1
+// torchrun --standalone --nproc_per_node=2 python/example_train.py
+// ```
+
+// **Notes**
+
+// * The previous error was due to deprecated/renamed scikit-build-core keys. `cmake.version` and
+//   `cmake.args` now live directly under `[tool.scikit-build]`.
+// * If your system doesn't provide a `pybind11` CMake config, ensure `pip show pybind11` is installed in the
+//   same environment and that CMake sees it (scikit-build-core handles this automatically when `pybind11` is a
+//   build requirement).
+// * If you hit linker errors for NCCL, print CMake cache (`build/CMakeCache.txt`) and verify `NCCL_INCLUDE_DIR`
+//   and `NCCL_LIBRARY` are correct.
